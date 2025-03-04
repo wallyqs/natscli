@@ -76,6 +76,11 @@ func (c *perfCmd) perfAction(_ *fisk.ParseContext) error {
 		return fmt.Errorf("first connection failed: %v", err)
 	}
 
+	c2, err := newNatsConn("", natsOpts()...)
+	if err != nil {
+		return fmt.Errorf("first connection failed: %v", err)
+	}
+
 	// reset to not use the stored conn or context
 	opts().Conn = nil
 
@@ -111,7 +116,7 @@ func (c *perfCmd) perfAction(_ *fisk.ParseContext) error {
 	// Async Subscriber (Runs in its own Goroutine)
 	i := 0
 	var firstAckTime time.Time
-	_, err = c1.Subscribe(fmt.Sprintf("%s.*", inbox), func(msg *nats.Msg) {
+	_, err = c2.Subscribe(fmt.Sprintf("%s.*", inbox), func(msg *nats.Msg) {
 		i++
 		if i == 1 {
 			firstAckTime = time.Now()
@@ -135,7 +140,7 @@ func (c *perfCmd) perfAction(_ *fisk.ParseContext) error {
 	if err != nil {
 		return fmt.Errorf("subscribing on second connection failed: %v", err)
 	}
-	c1.Flush()
+	c2.Flush()
 
 	// wait for routes to be established so we get every message
 	err = c.waitForRoute(c1, c1)
