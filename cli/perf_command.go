@@ -42,7 +42,7 @@ type perfCmd struct {
 	subject       string
 	minDelay      int
 	inflight      int
-	backoff       int
+	stall       int
 }
 
 func configurePerfCommand(app commandHost) {
@@ -56,7 +56,7 @@ func configurePerfCommand(app commandHost) {
 	perf.Flag("histogram", "Output file to store the histogram in").StringVar(&c.histFile)
 	perf.Flag("subject", "Stream subject").Default("foo").StringVar(&c.subject)
 	perf.Flag("inflight", "Max Inflight Acks").Default("-1").IntVar(&c.inflight)
-	perf.Flag("backoff", "Backoff time when there are too many inflight acks").Default("0").IntVar(&c.backoff)
+	perf.Flag("stall", "Stall time when there are too many inflight acks").Default("0").IntVar(&c.stall)
 }
 
 func init() {
@@ -184,13 +184,18 @@ func (c *perfCmd) perfAction(_ *fisk.ParseContext) error {
 
 	// Now publish.
 	var lastDelay time.Time
-	backoff := time.Duration(c.backoff) * time.Millisecond
+	var totalStalls int
+	var stallTime time.Duration
+	stall := time.Duration(c.stall) * time.Millisecond
 	for i := 0; i < c.numPubs; i++ {
 		if maxInflight > 0 {
-			if cin := atomic.LoadInt64(&inflight); cin > 0 && cin > maxInflight && time.Since(lastDelay) > backoff {
+			if cin := atomic.LoadInt64(&inflight); cin > 0 && cin > maxInflight/4 && time.Since(lastDelay) > stall {
 				mu.Lock()
 				fmt.Printf("*")
+				totalStalls++
+				t0 := time.Now()
 				cond.Wait()
+				stallTime += time.Since(t0)
 				mu.Unlock()
 				lastDelay = time.Now()
 			}
@@ -267,6 +272,9 @@ func (c *perfCmd) perfAction(_ *fisk.ParseContext) error {
 	log.Printf("Last Sent Wall Time : %v", c.fmtDur(pubDur))
 	log.Printf("Last Recv Wall Time : %v", c.fmtDur(subDur))
 	log.Printf("Acks Wait Time      : %v", c.fmtDur(ackDur-pubDur))
+	log.Printf("Stalls              : %v", totalStalls)
+	log.Printf("Stalls/Sec          : %v", c.rps(totalStalls, pubDur))
+	log.Printf("Stalls Time         : %v", stallTime)
 
 	return nil
 }
