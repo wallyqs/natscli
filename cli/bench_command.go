@@ -14,7 +14,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -79,6 +78,7 @@ const (
 	benchDefaultServiceVersion      = "1.0.0"
 	benchTypeCorePub                = "pub"
 	benchTypeCoreSub                = "sub"
+	benchTypeCoreReq                = "req"
 	benchTypeServiceRequest         = "request"
 	benchTypeServiceServe           = "reply"
 	benchTypeJSPub                  = "jspub"
@@ -161,6 +161,13 @@ func configureBenchCommand(app commandHost) {
 	coreSub.Arg("subject", "Subject to use for the benchmark").Required().StringVar(&c.subject)
 	coreSub.Flag("multisubject", "Multi-subject mode, each message is published on a subject that includes the publisher's message sequence number as a token").UnNegatableBoolVar(&c.multiSubject)
 	addCommonFlags(coreSub)
+
+	coreReq := benchCommand.Command("req", "Core NATS request/reply benchmark").Action(c.reqAction)
+	coreReq.Arg("subject", "Subject to use for the benchmark").Required().StringVar(&c.subject)
+	coreReq.Flag("sleep", "Sleep for the specified interval between requests").Default("0s").PlaceHolder("DURATION").DurationVar(&c.sleep)
+	coreReq.Flag("payload", "File containing the payload to send").ExistingFileVar(&c.payloadFilename)
+	coreReq.Flag("header", "Adds headers to the message using K:V format").Short('H').StringsVar(&c.hdrs)
+	addCommonFlags(coreReq)
 
 	microService := benchCommand.Command("service", "Micro-service mode")
 	microService.Flag("sleep", "Sleep for the specified interval between requests or before replying to the request").Default("0s").PlaceHolder("DURATION").DurationVar(&c.sleep)
@@ -331,6 +338,10 @@ func (c *benchCmd) generateBanner(benchType string) string {
 		benchTypeLabel = "Core NATS subscribe"
 		argnvps = append(argnvps, nvp{"subject", c.getSubscribeSubject()})
 		argnvps = append(argnvps, nvp{"multi-subject", f(c.multiSubject)})
+	case benchTypeCoreReq:
+		benchTypeLabel = "Core NATS request"
+		argnvps = append(argnvps, nvp{"subject", c.subject})
+		argnvps = append(argnvps, nvp{"sleep", f(c.sleep)})
 	case benchTypeServiceRequest:
 		benchTypeLabel = "Core NATS service request"
 		argnvps = append(argnvps, nvp{"subject", c.subject})
@@ -702,6 +713,68 @@ func (c *benchCmd) requestAction(_ *fisk.ParseContext) error {
 		if err := <-errChan; err != nil {
 			log.Printf("Error from client %d: %v", i, err)
 			// only return the first error since only one error can be returned
+			if err2 == nil {
+				err2 = err
+			}
+		}
+	}
+
+	if err2 != nil {
+		return err2
+	}
+
+	bm.Close()
+	err = c.printResults(bm)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *benchCmd) reqAction(_ *fisk.ParseContext) error {
+	err := c.processActionArgs()
+	if err != nil {
+		return err
+	}
+
+	banner := c.generateBanner(benchTypeCoreReq)
+
+	log.Println(banner)
+
+	bm := bench.NewBenchmark("NATS", 0, c.numClients)
+
+	startwg := &sync.WaitGroup{}
+	donewg := &sync.WaitGroup{}
+	errChan := make(chan error, c.numClients)
+
+	pubCounts := bench.MsgsPerClient(c.numMsg, c.numClients)
+	trigger := make(chan struct{})
+	for i := 0; i < c.numClients; i++ {
+		nc, err := nats.Connect(opts().Config.ServerURL(), natsOpts()...)
+		if err != nil {
+			return fmt.Errorf("client number %d failed to connect: %w", i, err)
+		}
+		defer nc.Close()
+
+		startwg.Add(1)
+		donewg.Add(1)
+
+		go c.runCoreRequester(bm, errChan, nc, startwg, donewg, trigger, pubCounts[i], c.offset(i, pubCounts), strconv.Itoa(i))
+	}
+
+	if c.progressBar {
+		uiprogress.Start()
+	}
+
+	startwg.Wait()
+	close(trigger)
+	donewg.Wait()
+
+	var err2 error
+	for i := 0; i < c.numClients; i++ {
+		if err := <-errChan; err != nil {
+			log.Printf("Error from client %d: %v", i, err)
 			if err2 == nil {
 				err2 = err
 			}
@@ -1606,9 +1679,6 @@ func (c *benchCmd) coreNATSPublisher(nc *nats.Conn, progress *uiprogress.Bar, pa
 }
 
 func (c *benchCmd) coreNATSRequester(nc *nats.Conn, progress *uiprogress.Bar, payloadSize int, numMsg int, offset int) error {
-	errBytes := []byte("error")
-	minusByte := byte('-')
-
 	state := "Requesting"
 	payload, err := c.getPayload(payloadSize)
 	if err != nil {
@@ -1637,13 +1707,9 @@ func (c *benchCmd) coreNATSRequester(nc *nats.Conn, progress *uiprogress.Bar, pa
 
 		message.Subject = c.getPublishSubject(i + offset)
 
-		m, err := nc.RequestMsg(&message, opts().Timeout)
+		_, err := nc.RequestMsg(&message, opts().Timeout)
 		if err != nil {
 			return fmt.Errorf("requesting: %w", err)
-		}
-
-		if len(m.Data) == 0 || m.Data[0] == minusByte || bytes.Contains(m.Data, errBytes) {
-			log.Fatalf("Request did not receive a good reply: %q", m.Data)
 		}
 
 		time.Sleep(c.sleep)
