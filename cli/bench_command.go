@@ -74,6 +74,7 @@ type benchCmd struct {
 	hdrs                 []string
 	filterSubjects       []string
 	skipStream           bool
+	sentAt               bool
 }
 
 const (
@@ -146,6 +147,7 @@ func configureBenchCommand(app commandHost) {
 		f.Flag("batch", "The number of asynchronous JS publish calls before waiting for all the publish acknowledgements (set to 1 for synchronous)").Default("500").IntVar(&c.batchSize)
 		f.Flag("batch-publish", "Use atomic batch API").Default("false").BoolVar(&c.batchApi)
 		f.Flag("skip-stream", "Skip checking if the stream exists").Default("false").BoolVar(&c.skipStream)
+		f.Flag("sent-at", "Add Nats-Sent-At header with unix nano timestamp to each message").Default("false").UnNegatableBoolVar(&c.sentAt)
 	}
 
 	addKVPutFlags := func(f *fisk.CmdClause) {
@@ -355,6 +357,9 @@ func (c *benchCmd) generateBanner(benchType string) string {
 		argnvps = append(argnvps, nvp{"multi-subject", f(c.multiSubject)})
 		argnvps = append(argnvps, nvp{"multi-subject-max", f(c.multiSubjectMax)})
 		argnvps = append(argnvps, nvp{"batch", f(c.batchSize)})
+		if c.sentAt {
+			argnvps = append(argnvps, nvp{"sent-at", f(c.sentAt)})
+		}
 		jsAttributes()
 		streamOrBucketAttribues()
 	case benchTypeJSOrdered:
@@ -1725,6 +1730,9 @@ func (c *benchCmd) jsPublisher(nc *nats.Conn, progress *uiprogress.Bar, payloadS
 				if c.deDuplication {
 					message.Header.Set(nats.MsgIdHdr, batchId+"-"+strconv.Itoa(i+j+offset))
 				}
+				if c.sentAt {
+					message.Header.Set("Nats-Sent-At", strconv.FormatInt(time.Now().UnixNano(), 10))
+				}
 				message.Header.Set("Nats-Batch-Id", batchId)
 				message.Header.Set("Nats-Batch-Sequence", strconv.Itoa(j+1))
 				message.Subject = c.getPublishSubject(i + j + offset)
@@ -1737,6 +1745,9 @@ func (c *benchCmd) jsPublisher(nc *nats.Conn, progress *uiprogress.Bar, payloadS
 
 			if c.deDuplication {
 				message.Header.Set(nats.MsgIdHdr, batchId+"-"+strconv.Itoa(i+msgs+offset))
+			}
+			if c.sentAt {
+				message.Header.Set("Nats-Sent-At", strconv.FormatInt(time.Now().UnixNano(), 10))
 			}
 			message.Header.Set("Nats-Batch-Id", batchId)
 			message.Header.Set("Nats-Batch-Sequence", strconv.Itoa(msgs))
@@ -1773,6 +1784,9 @@ func (c *benchCmd) jsPublisher(nc *nats.Conn, progress *uiprogress.Bar, payloadS
 			for j := 0; j < c.batchSize && (i+j) < numMsg; j++ {
 				if c.deDuplication {
 					message.Header.Set(nats.MsgIdHdr, idPrefix+"-"+pubNumber+"-"+strconv.Itoa(i+j+offset))
+				}
+				if c.sentAt {
+					message.Header.Set("Nats-Sent-At", strconv.FormatInt(time.Now().UnixNano(), 10))
 				}
 
 				message.Subject = c.getPublishSubject(i + j + offset)
@@ -1816,6 +1830,9 @@ func (c *benchCmd) jsPublisher(nc *nats.Conn, progress *uiprogress.Bar, payloadS
 
 			if c.deDuplication {
 				message.Header.Set(nats.MsgIdHdr, idPrefix+"-"+pubNumber+"-"+strconv.Itoa(i+offset))
+			}
+			if c.sentAt {
+				message.Header.Set("Nats-Sent-At", strconv.FormatInt(time.Now().UnixNano(), 10))
 			}
 
 			message.Subject = c.getPublishSubject(i + offset)
