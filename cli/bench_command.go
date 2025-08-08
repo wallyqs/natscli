@@ -73,6 +73,8 @@ type benchCmd struct {
 	payloadFilename      string
 	hdrs                 []string
 	filterSubjects       []string
+	multiStream          bool
+	multiStreamMax       int
 }
 
 const (
@@ -144,6 +146,8 @@ func configureBenchCommand(app commandHost) {
 		f.Flag("dedupwindow", "Sets the duration of the stream's deduplication functionality").Default("2m").DurationVar(&c.deDuplicationWindow)
 		f.Flag("batch", "The number of asynchronous JS publish calls before waiting for all the publish acknowledgements (set to 1 for synchronous)").Default("500").IntVar(&c.batchSize)
 		f.Flag("batch-publish", "Use atomic batch API").Default("false").BoolVar(&c.batchApi)
+		f.Flag("multistream", "Publish to multiple streams or without stream binding").UnNegatableBoolVar(&c.multiStream)
+		f.Flag("multistreammax", "Maximum number of streams to use in multi-stream mode (0 means no stream binding)").Default("0").IntVar(&c.multiStreamMax)
 	}
 
 	addKVPutFlags := func(f *fisk.CmdClause) {
@@ -353,6 +357,10 @@ func (c *benchCmd) generateBanner(benchType string) string {
 		argnvps = append(argnvps, nvp{"multi-subject", f(c.multiSubject)})
 		argnvps = append(argnvps, nvp{"multi-subject-max", f(c.multiSubjectMax)})
 		argnvps = append(argnvps, nvp{"batch", f(c.batchSize)})
+		if c.multiStream {
+			argnvps = append(argnvps, nvp{"multi-stream", f(c.multiStream)})
+			argnvps = append(argnvps, nvp{"multi-stream-max", f(c.multiStreamMax)})
+		}
 		jsAttributes()
 		streamOrBucketAttribues()
 	case benchTypeJSOrdered:
@@ -469,6 +477,18 @@ func (c *benchCmd) getSubscribeSubject() string {
 }
 
 func (c *benchCmd) getPublishSubject(number int) string {
+	// Handle multistream mode
+	if c.multiStream && c.multiStreamMax > 0 {
+		// Distribute messages across multiple streams
+		streamIndex := number % c.multiStreamMax
+		if c.multiSubject {
+			return fmt.Sprintf("%s.%d.%d", c.subject, streamIndex, number)
+		} else {
+			return fmt.Sprintf("%s.%d", c.subject, streamIndex)
+		}
+	}
+	
+	// Normal mode
 	if c.multiSubject {
 		if c.multiSubjectMax == 0 {
 			return c.subject + "." + strconv.Itoa(number)
@@ -818,27 +838,57 @@ func (c *benchCmd) jspubAction(_ *fisk.ParseContext) error {
 
 	var s jetstream.Stream
 
-	if c.createStream && !c.streamExplicitlySet {
-		// create the stream with our attributes, will create it if it doesn't exist or make sure the existing one has the same attributes
-		s, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{Name: c.streamOrBucketName, Subjects: []string{c.getSubscribeSubject()}, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardNew, Storage: c.storageType(), Replicas: c.replicas, MaxBytes: c.streamMaxBytes, Duplicates: c.deDuplicationWindow})
-		if err != nil {
-			return fmt.Errorf("could not create the stream. If you want to delete and re-define the stream use `nats stream delete %s`: %w", c.streamOrBucketName, err)
+	// Skip stream creation/validation in multistream mode with no stream binding
+	if !c.multiStream || (c.multiStream && c.multiStreamMax > 0) {
+		if c.multiStream && c.multiStreamMax > 0 {
+			// Create multiple streams for multistream mode
+			for i := 0; i < c.multiStreamMax; i++ {
+				streamName := fmt.Sprintf("%s_%d", c.streamOrBucketName, i)
+				subjectPattern := fmt.Sprintf("%s.%d.*", c.subject, i)
+				if c.createStream {
+					_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+						Name: streamName, 
+						Subjects: []string{subjectPattern}, 
+						Retention: jetstream.LimitsPolicy, 
+						Discard: jetstream.DiscardNew, 
+						Storage: c.storageType(), 
+						Replicas: c.replicas, 
+						MaxBytes: c.streamMaxBytes, 
+						Duplicates: c.deDuplicationWindow,
+					})
+					if err != nil {
+						return fmt.Errorf("could not create stream %s: %w", streamName, err)
+					}
+					log.Printf("Created/Updated stream: %s", streamName)
+				}
+			}
+		} else {
+			// Normal single stream mode
+			if c.createStream && !c.streamExplicitlySet {
+				// create the stream with our attributes, will create it if it doesn't exist or make sure the existing one has the same attributes
+				s, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{Name: c.streamOrBucketName, Subjects: []string{c.getSubscribeSubject()}, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardNew, Storage: c.storageType(), Replicas: c.replicas, MaxBytes: c.streamMaxBytes, Duplicates: c.deDuplicationWindow})
+				if err != nil {
+					return fmt.Errorf("could not create the stream. If you want to delete and re-define the stream use `nats stream delete %s`: %w", c.streamOrBucketName, err)
+				}
+				// TODO: a way to wait for the stream to be ready (e.g. when updating the stream's config (e.g. from R1 to R3))
+			} else {
+				s, err = js.Stream(ctx, c.streamOrBucketName)
+				if err != nil {
+					return fmt.Errorf("stream '%s' does not exist, create it with --create", c.streamOrBucketName)
+				}
+				log.Printf("Using stream: %s", c.streamOrBucketName)
+			}
+			
+			if c.purge {
+				log.Printf("Purging the stream")
+				err = s.Purge(ctx)
+				if err != nil {
+					return err
+				}
+			}
 		}
-		// TODO: a way to wait for the stream to be ready (e.g. when updating the stream's config (e.g. from R1 to R3))
 	} else {
-		s, err = js.Stream(ctx, c.streamOrBucketName)
-		if err != nil {
-			return fmt.Errorf("stream '%s' does not exist, create it with --create", c.streamOrBucketName)
-		}
-		log.Printf("Using stream: %s", c.streamOrBucketName)
-	}
-
-	if c.purge {
-		log.Printf("Purging the stream")
-		err = s.Purge(ctx)
-		if err != nil {
-			return err
-		}
+		log.Printf("Multi-stream mode: Publishing without stream binding")
 	}
 
 	pubCounts := bench.MsgsPerClient(c.numMsg, c.numClients)
