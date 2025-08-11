@@ -1906,11 +1906,12 @@ func (c *benchCmd) runCoreSubscriber(bm *bench.Benchmark, errChan chan error, nc
 		if progress != nil {
 			progress.Incr()
 		}
+		msg.Respond([]byte("{\"stream\":\"sbtl:0\",\"seq\":1}\n"))
 	}
 
 	state = "Receiving "
 
-	sub, err := nc.Subscribe(c.getSubscribeSubject(), mh)
+	sub, err := nc.QueueSubscribe(c.getSubscribeSubject(), "workers", mh)
 	if err != nil {
 		errChan <- fmt.Errorf("subscribing to '%s': %w", c.getSubscribeSubject(), err)
 		startwg.Done()
