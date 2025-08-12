@@ -70,6 +70,10 @@ type benchCmd struct {
 	payloadFilename      string
 	hdrs                 []string
 	filterSubjects       []string
+	skipStream           bool
+	sentAt               bool
+	benchStartTime       time.Time
+	benchEndTime         time.Time
 }
 
 const (
@@ -170,6 +174,8 @@ func configureBenchCommand(app commandHost) {
 	request := microService.Command("request", "Send a request and wait for its reply").Action(c.requestAction)
 	request.Help("Send a request and wait for a reply")
 	request.Arg("subject", "Subject to use for the benchmark").Required().StringVar(&c.subject)
+	request.Flag("multisubject", "Multi-subject mode, each message is published on a subject that includes the publisher's message sequence number as a token").UnNegatableBoolVar(&c.multiSubject)
+	request.Flag("multisubjectmax", "The maximum number of subjects to use in multi-subject mode").Default("64").IntVar(&c.multiSubjectMax)
 	request.Flag("payload", "File containing the payload to send").ExistingFileVar(&c.payloadFilename)
 	request.Flag("header", "Adds headers to the message using K:V format").Short('H').StringsVar(&c.hdrs)
 	// TODO: support randomized payload data
@@ -341,7 +347,11 @@ func (c *benchCmd) generateBanner(benchType string) string {
 		argnvps = append(argnvps, nvp{"multi-subject", f(c.multiSubject)})
 	case benchTypeServiceRequest:
 		benchTypeLabel = "Core NATS service request"
-		argnvps = append(argnvps, nvp{"subject", c.subject})
+		argnvps = append(argnvps, nvp{"subject", c.getSubscribeSubject()})
+		argnvps = append(argnvps, nvp{"multi-subject", f(c.multiSubject)})
+		if c.multiSubject {
+			argnvps = append(argnvps, nvp{"multi-subject-max", f(c.multiSubjectMax)})
+		}
 		argnvps = append(argnvps, nvp{"sleep", f(c.sleep)})
 	case benchTypeServiceServe:
 		benchTypeLabel = "Core NATS service serve"
@@ -452,6 +462,9 @@ func (c *benchCmd) printResults(bm *bench.Benchmark) error {
 	fmt.Println()
 	fmt.Println(bm.Report())
 
+	// Calculate and display additional throughput metrics
+	c.printThroughputSummary()
+
 	if c.csvFile != "" {
 		csv := bm.CSV()
 		err := os.WriteFile(c.csvFile, []byte(csv), 0600)
@@ -462,6 +475,35 @@ func (c *benchCmd) printResults(bm *bench.Benchmark) error {
 	}
 
 	return nil
+}
+
+func (c *benchCmd) printThroughputSummary() {
+	if c.benchStartTime.IsZero() || c.benchEndTime.IsZero() {
+		return
+	}
+
+	duration := c.benchEndTime.Sub(c.benchStartTime)
+	totalMessages := c.numMsg
+	totalBytes := int64(totalMessages) * int64(c.msgSize)
+	
+	if duration.Seconds() > 0 {
+		// Calculate messages per second
+		messagesPerSecond := float64(totalMessages) / duration.Seconds()
+		
+		// Calculate MB/s (already shown in the Report, but we calculate it for Gbps)
+		megabytesPerSecond := float64(totalBytes) / (1024.0 * 1024.0) / duration.Seconds()
+		
+		// Calculate Gbps (Gigabits per second)
+		// 1 byte = 8 bits, 1 Gbps = 1,000,000,000 bits per second
+		gigabitsPerSecond := float64(totalBytes*8) / 1000000000.0 / duration.Seconds()
+		
+		fmt.Printf("\nThroughput Summary:\n")
+		fmt.Printf("Total messages: %s\n", humanize.Comma(int64(totalMessages)))
+		fmt.Printf("Total data: %s\n", humanize.Bytes(uint64(totalBytes)))
+		fmt.Printf("Duration: %v\n", duration.Round(time.Millisecond))
+		fmt.Printf("Messages/sec: %s\n", humanize.Comma(int64(messagesPerSecond)))
+		fmt.Printf("Throughput: %.2f MB/s | %.3f Gbps\n", megabytesPerSecond, gigabitsPerSecond)
+	}
 }
 
 func (c *benchCmd) getSubscribeSubject() string {
@@ -712,8 +754,10 @@ func (c *benchCmd) requestAction(_ *fisk.ParseContext) error {
 	}
 
 	startwg.Wait()
+	c.benchStartTime = time.Now()
 	close(trigger)
 	donewg.Wait()
+	c.benchEndTime = time.Now()
 
 	var err2 error
 	for i := 0; i < c.numClients; i++ {
