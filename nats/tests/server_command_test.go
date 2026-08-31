@@ -1906,6 +1906,44 @@ func TestServerStreamCheck(t *testing.T) {
 		return string(b)
 	}
 
+	t.Run("stream without cluster info", func(t *testing.T) {
+		// A stream that is not part of a cluster has no ClusterInfo, this used
+		// to panic while comparing peers.
+		resp := server.ServerAPIJszResponse{
+			Server: &server.ServerInfo{Name: "s1", Host: "localhost", ID: "ID1", Version: "2.12.0", JetStream: true},
+			Data: &server.JSInfo{
+				ID:      "ID1",
+				Streams: 1,
+				AccountDetails: []*server.AccountDetail{{
+					Name: "TEST",
+					Id:   "TESTID",
+					Streams: []server.StreamDetail{{
+						Name:  "ORDERS",
+						State: server.StreamState{Msgs: 10, Bytes: 100, FirstSeq: 1, LastSeq: 10},
+					}},
+				}},
+			},
+		}
+
+		b, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatalf("failed to marshal ServerAPIJszResponse: %v", err)
+		}
+
+		output, err := runNatsCliWithInput(t, string(b), "server stream-check --stdin")
+		if err != nil {
+			t.Fatalf("stream-check failed: %v\nOutput: %s", err, output)
+		}
+
+		out := string(output)
+		if !strings.Contains(out, "NO_CLUSTER") {
+			t.Errorf("expected NO_CLUSTER status:\n%s", out)
+		}
+		if !strings.Contains(out, "ORDERS") {
+			t.Errorf("expected ORDERS row:\n%s", out)
+		}
+	})
+
 	t.Run("unsynced percentage differences", func(t *testing.T) {
 		leader := makeStreamCheckResp(t, "s1", "ID1", 1000, 10000, 50, 10, 3, 1, 1000)
 		replica2 := makeStreamCheckResp(t, "s2", "ID2", 990, 9800, 50, 5, 3, 1, 990)

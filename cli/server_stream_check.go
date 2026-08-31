@@ -155,7 +155,15 @@ func (c *StreamCheckCmd) streamCheck(_ *fisk.ParseContext) error {
 	}
 
 	// Collect all info from servers.
-	streams := make(map[string]map[string]*streamDetail)
+	type streamKey struct {
+		account   string
+		raftGroup string
+	}
+	type replicaKey struct {
+		streamKey
+		server string
+	}
+	streams := make(map[streamKey]map[string]*streamDetail)
 	for _, resp := range responses {
 		if resp.Server == nil || resp.Data == nil {
 			continue
@@ -169,7 +177,7 @@ func (c *StreamCheckCmd) streamCheck(_ *fisk.ParseContext) error {
 				if stream.RaftGroup == "" && stream.Cluster != nil {
 					stream.RaftGroup = stream.Cluster.RaftGroup
 				}
-				key := fmt.Sprintf("%s|%s", acc.Name, stream.RaftGroup)
+				key := streamKey{account: acc.Name, raftGroup: stream.RaftGroup}
 				if m, ok = streams[key]; !ok {
 					m = make(map[string]*streamDetail)
 					streams[key] = m
@@ -186,13 +194,21 @@ func (c *StreamCheckCmd) streamCheck(_ *fisk.ParseContext) error {
 			}
 		}
 	}
-	keys := make([]string, 0)
-	for k := range streams {
-		for kk := range streams[k] {
-			keys = append(keys, fmt.Sprintf("%s/%s", k, kk))
+	keys := make([]replicaKey, 0, len(streams))
+	for key, replicas := range streams {
+		for serverName := range replicas {
+			keys = append(keys, replicaKey{streamKey: key, server: serverName})
 		}
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].account != keys[j].account {
+			return keys[i].account < keys[j].account
+		}
+		if keys[i].raftGroup != keys[j].raftGroup {
+			return keys[i].raftGroup < keys[j].raftGroup
+		}
+		return keys[i].server < keys[j].server
+	})
 
 	title := ""
 	if !c.csv {
@@ -210,17 +226,16 @@ func (c *StreamCheckCmd) streamCheck(_ *fisk.ParseContext) error {
 	var prev, prevAccount string
 	for i, k := range keys {
 		var unsynced bool
-		av := strings.Split(k, "|")
-		accName := av[0]
-		v := strings.Split(av[1], "/")
-		raftName, serverName := v[0], v[1]
+		accName, raftName, serverName := k.account, k.raftGroup, k.server
 		if c.raftGroup != "" && raftName != c.raftGroup {
 			continue
 		}
 
-		key := fmt.Sprintf("%s|%s", accName, raftName)
-		stream := streams[key]
+		stream := streams[k.streamKey]
 		replica := stream[serverName]
+		if replica == nil {
+			continue
+		}
 		status := "IN SYNC"
 
 		if c.streamName != "" && replica.StreamName != c.streamName {
@@ -243,20 +258,14 @@ func (c *StreamCheckCmd) streamCheck(_ *fisk.ParseContext) error {
 			}
 			// Cannot trust results unless coming from the stream leader.
 			// Need Stream INFO and collect multiple responses instead.
-			if peer.Cluster.Leader != "" && replica.Cluster.Leader != "" && peer.Cluster.Leader != replica.Cluster.Leader {
+			if peer.Cluster != nil && replica.Cluster != nil &&
+				peer.Cluster.Leader != "" && replica.Cluster.Leader != "" &&
+				peer.Cluster.Leader != replica.Cluster.Leader {
 				status = "MULTILEADER"
 				unsynced = true
 			}
 		}
-		if c.unsyncedFilter && !unsynced {
-			continue
-		}
 
-		if replica == nil {
-			status = "?"
-			unsynced = true
-			continue
-		}
 		var alen int
 		if len(replica.Account) > 10 {
 			alen = 10
@@ -269,25 +278,42 @@ func (c *StreamCheckCmd) streamCheck(_ *fisk.ParseContext) error {
 		// Mark it in case it is a leader.
 		var suffix string
 		var isStreamLeader bool
-		if serverName == replica.Cluster.Leader {
+		var clusterLeader string
+		switch {
+		case replica.Cluster == nil:
+			// Not part of a cluster, for example a stream that has not been
+			// assigned to a Raft group yet.
+			status = "NO_CLUSTER"
+			unsynced = true
+		case serverName == replica.Cluster.Leader:
+			clusterLeader = replica.Cluster.Leader
 			isStreamLeader = true
 			suffix = "*"
-		} else if replica.Cluster.Leader == "" {
+		case replica.Cluster.Leader == "":
 			status = "LEADERLESS"
 			unsynced = true
-		} else if replica.RaftGroup == "" {
-			status = "MISSING_GROUP"
-			unsynced = true
+		default:
+			clusterLeader = replica.Cluster.Leader
+			if replica.RaftGroup == "" {
+				status = "MISSING_GROUP"
+				unsynced = true
+			}
 		}
 
 		var replicasInfo string // PEER
-		for _, r := range replica.Cluster.Replicas {
-			if isStreamLeader && r.Name == replica.Cluster.Leader {
-				status = "LEADER_IS_FOLLOWER"
-				unsynced = true
+		if replica.Cluster != nil {
+			for _, r := range replica.Cluster.Replicas {
+				if isStreamLeader && r.Name == replica.Cluster.Leader {
+					status = "LEADER_IS_FOLLOWER"
+					unsynced = true
+				}
+				info := fmt.Sprintf("%s(current=%-5v,offline=%v)", r.Name, r.Current, r.Offline)
+				replicasInfo = fmt.Sprintf("%-40s %s", info, replicasInfo)
 			}
-			info := fmt.Sprintf("%s(current=%-5v,offline=%v)", r.Name, r.Current, r.Offline)
-			replicasInfo = fmt.Sprintf("%-40s %s", info, replicasInfo)
+		}
+
+		if c.unsyncedFilter && !unsynced {
+			continue
 		}
 
 		// Include Healthz if option added.
@@ -322,24 +348,27 @@ func (c *StreamCheckCmd) streamCheck(_ *fisk.ParseContext) error {
 
 		node := fmt.Sprintf("%s%s", serverName, suffix)
 
-		if c.unsyncedFilter && !isStreamLeader {
-			ld := stream[replica.Cluster.Leader]
-			table.AddRow(replica.StreamName, replica.RaftGroup, account, replica.AccountID, node,
+		row := []any{replica.StreamName, replica.RaftGroup, account, replica.AccountID, node}
+		if ld := stream[clusterLeader]; c.unsyncedFilter && !isStreamLeader && ld != nil {
+			row = append(row,
 				util.FmtReplicaDrift(float64(replica.State.Msgs), float64(ld.State.Msgs)),
 				util.FmtReplicaDrift(float64(replica.State.Bytes), float64(ld.State.Bytes)),
 				util.FmtReplicaDrift(float64(replica.State.NumSubjects), float64(ld.State.NumSubjects)),
 				util.FmtReplicaDrift(float64(replica.State.NumDeleted), float64(ld.State.NumDeleted)),
 				util.FmtReplicaDrift(float64(replica.State.Consumers), float64(ld.State.Consumers)),
 				util.FmtReplicaDrift(float64(replica.State.FirstSeq), float64(ld.State.FirstSeq)),
-				util.FmtReplicaDrift(float64(replica.State.LastSeq), float64(ld.State.LastSeq)),
-				status, replica.Cluster.Leader, strings.TrimSpace(replicasInfo), healthStatus)
+				util.FmtReplicaDrift(float64(replica.State.LastSeq), float64(ld.State.LastSeq)))
 		} else {
-			table.AddRow(replica.StreamName, replica.RaftGroup, account, replica.AccountID, node,
+			row = append(row,
 				replica.State.Msgs, replica.State.Bytes, replica.State.NumSubjects,
 				replica.State.NumDeleted, replica.State.Consumers, replica.State.FirstSeq,
-				replica.State.LastSeq, status, replica.Cluster.Leader,
-				strings.TrimSpace(replicasInfo), healthStatus)
+				replica.State.LastSeq)
 		}
+		row = append(row, status, clusterLeader, strings.TrimSpace(replicasInfo))
+		if c.health {
+			row = append(row, healthStatus)
+		}
+		table.AddRow(row...)
 	}
 
 	if c.csv {
